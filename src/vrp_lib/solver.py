@@ -251,3 +251,121 @@ def solve_vrptw(
         loads=loads,
         schedule=schedule,
     )
+
+
+def solve_pdptw(
+    distance: Sequence[Sequence[int]],
+    demands: Sequence[int],
+    time_windows: Sequence[tuple[int, int]],
+    pairs: Sequence[tuple[int, int]],
+    vehicle_capacities: Sequence[int],
+    service_time: int,
+    horizon: int,
+    depot: int = 0,
+    wait_slack: int = 60,
+    time_limit_seconds: int = 10,
+    first_solution_strategy: int = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
+    local_search_metaheuristic: int = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
+) -> SolveResult:
+    n = len(distance)
+    num_vehicles = len(vehicle_capacities)
+    manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def distance_callback(from_index: int, to_index: int) -> int:
+        return distance[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+    transit_idx = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+    def demand_callback(from_index: int) -> int:
+        return demands[manager.IndexToNode(from_index)]
+
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_idx, 0, list(vehicle_capacities), True, "Capacity",
+    )
+
+    def time_callback(from_index: int, to_index: int) -> int:
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        st = 0 if from_node == depot else service_time
+        return st + distance[from_node][to_node]
+
+    time_idx = routing.RegisterTransitCallback(time_callback)
+    routing.AddDimension(time_idx, wait_slack, horizon, False, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
+
+    for node in range(n):
+        if node == depot:
+            continue
+        a, b = time_windows[node]
+        time_dim.CumulVar(manager.NodeToIndex(node)).SetRange(int(a), int(b))
+
+    depot_open, depot_close = time_windows[depot]
+    for v in range(num_vehicles):
+        time_dim.CumulVar(routing.Start(v)).SetRange(int(depot_open), int(depot_close))
+        time_dim.CumulVar(routing.End(v)).SetRange(int(depot_open), int(depot_close))
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.Start(v)))
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.End(v)))
+
+    for pickup_node, delivery_node in pairs:
+        p_idx = manager.NodeToIndex(pickup_node)
+        d_idx = manager.NodeToIndex(delivery_node)
+        routing.AddPickupAndDelivery(p_idx, d_idx)
+        routing.solver().Add(routing.VehicleVar(p_idx) == routing.VehicleVar(d_idx))
+        routing.solver().Add(time_dim.CumulVar(p_idx) <= time_dim.CumulVar(d_idx))
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = first_solution_strategy
+    params.local_search_metaheuristic = local_search_metaheuristic
+    params.time_limit.FromSeconds(time_limit_seconds)
+
+    solution = routing.SolveWithParameters(params)
+    if solution is None:
+        return SolveResult(routes=[], total_distance=0, status=routing.status())
+
+    routes: list[list[int]] = []
+    loads: list[int] = []
+    schedule: list[dict] = []
+    total = 0
+    for vehicle_id in range(num_vehicles):
+        index = routing.Start(vehicle_id)
+        route: list[int] = []
+        route_distance = 0
+        peak_load = 0
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            arrive = solution.Min(time_dim.CumulVar(index))
+            depart = arrive + (0 if node == depot else service_time)
+            peak_load = max(peak_load, solution.Value(routing.GetDimensionOrDie("Capacity").CumulVar(index)))
+            schedule.append({
+                "vehicle": vehicle_id,
+                "node": node,
+                "arrive": arrive,
+                "leave": depart,
+            })
+            route.append(node)
+            prev = index
+            index = solution.Value(routing.NextVar(index))
+            route_distance += routing.GetArcCostForVehicle(prev, index, vehicle_id)
+        end_node = manager.IndexToNode(index)
+        end_arrive = solution.Min(time_dim.CumulVar(index))
+        schedule.append({
+            "vehicle": vehicle_id,
+            "node": end_node,
+            "arrive": end_arrive,
+            "leave": end_arrive,
+        })
+        route.append(end_node)
+        routes.append(route)
+        loads.append(peak_load)
+        total += route_distance
+
+    return SolveResult(
+        routes=routes,
+        total_distance=total,
+        status=routing.status(),
+        loads=loads,
+        schedule=schedule,
+    )
