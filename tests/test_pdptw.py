@@ -45,6 +45,64 @@ def test_pdptw_satisfies_pair_constraints():
         )
 
 
+def test_pdptw_respects_max_ride_time():
+    # Two requests where the solver would naturally chain them through a
+    # long detour. With max_ride_time small, it must take each one direct.
+    points = [(0, 0), (10, 0), (60, 0), (0, 10), (0, 60)]
+    demands = [0, +1, -1, +1, -1]
+    windows = [(0, 480), (10, 60), (60, 300), (10, 60), (60, 300)]
+    pairs = [(1, 2), (3, 4)]
+    distance = _make_distance(points)
+
+    # Generous baseline: solver is free to consolidate
+    baseline = solve_pdptw(
+        distance, demands, windows, pairs,
+        vehicle_capacities=[2, 2],
+        service_time=5, horizon=480,
+        time_limit_seconds=5,
+    )
+    assert baseline.status == 1
+
+    # Now constrain: each request must take ≤ 70 minutes
+    tight = solve_pdptw(
+        distance, demands, windows, pairs,
+        vehicle_capacities=[2, 2],
+        service_time=5, horizon=480,
+        max_ride_time=70,
+        time_limit_seconds=5,
+    )
+    assert tight.status == 1
+
+    # Verify ride time per pair against the schedule.
+    by_node = {entry["node"]: entry for entry in tight.schedule}
+    for p_node, d_node in pairs:
+        ride = by_node[d_node]["arrive"] - by_node[p_node]["arrive"]
+        assert ride <= 70, f"pair ({p_node},{d_node}) ride={ride} exceeded 70"
+
+
+def test_pdptw_max_ride_per_request():
+    points = [(0, 0), (10, 0), (50, 0), (0, 10), (0, 50)]
+    demands = [0, +1, -1, +1, -1]
+    windows = [(0, 480), (10, 60), (50, 300), (10, 60), (50, 300)]
+    pairs = [(1, 2), (3, 4)]
+    distance = _make_distance(points)
+
+    # Per-request limits: request 0 strict, request 1 loose.
+    result = solve_pdptw(
+        distance, demands, windows, pairs,
+        vehicle_capacities=[2, 2],
+        service_time=5, horizon=480,
+        max_ride_time=[60, 240],
+        time_limit_seconds=5,
+    )
+    assert result.status == 1
+
+    by_node = {entry["node"]: entry for entry in result.schedule}
+    rides = [by_node[d]["arrive"] - by_node[p]["arrive"] for p, d in pairs]
+    assert rides[0] <= 60
+    assert rides[1] <= 240
+
+
 def test_pdptw_respects_time_windows():
     points = [(0, 0), (10, 0), (20, 0)]
     demands = [0, +1, -1]

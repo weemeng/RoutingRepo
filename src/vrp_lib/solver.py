@@ -264,6 +264,7 @@ def solve_pdptw(
     depot: int = 0,
     wait_slack: int = 60,
     time_limit_seconds: int = 10,
+    max_ride_time: int | Sequence[int] | None = None,
     first_solution_strategy: int = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
     local_search_metaheuristic: int = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
 ) -> SolveResult:
@@ -315,6 +316,18 @@ def solve_pdptw(
         routing.AddPickupAndDelivery(p_idx, d_idx)
         routing.solver().Add(routing.VehicleVar(p_idx) == routing.VehicleVar(d_idx))
         routing.solver().Add(time_dim.CumulVar(p_idx) <= time_dim.CumulVar(d_idx))
+
+    if max_ride_time is not None:
+        if isinstance(max_ride_time, int):
+            ride_limits = [max_ride_time] * len(pairs)
+        else:
+            ride_limits = list(max_ride_time)
+        for (pickup_node, delivery_node), limit in zip(pairs, ride_limits):
+            p_idx = manager.NodeToIndex(pickup_node)
+            d_idx = manager.NodeToIndex(delivery_node)
+            routing.solver().Add(
+                time_dim.CumulVar(d_idx) - time_dim.CumulVar(p_idx) <= int(limit)
+            )
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = first_solution_strategy
