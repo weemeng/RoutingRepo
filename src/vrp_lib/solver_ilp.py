@@ -378,3 +378,286 @@ def solve_toptw_ilp(
         schedule=schedule,
         total_profit=total_profit,
     )
+
+
+# ---------------------------------------------------------------------------
+# Time-expanded graph (TEG) TOPTW
+# ---------------------------------------------------------------------------
+
+TEGNode = tuple[int, int]
+TEGArc = tuple[TEGNode, TEGNode]
+
+
+def _shift_of(tau: int, shift_windows: Sequence[tuple[int, int]]) -> int:
+    """Return the index of the shift containing tau (half-open `[open, close)`).
+
+    Tau exactly at the close of the final shift is treated as belonging to
+    that final shift so that arcs landing on the horizon boundary are valid.
+    """
+    for s, (lo, hi) in enumerate(shift_windows):
+        if lo <= tau < hi:
+            return s
+    if shift_windows and tau == shift_windows[-1][1]:
+        return len(shift_windows) - 1
+    raise ValueError(f"time {tau} falls outside shift_windows {list(shift_windows)}")
+
+
+def _round_up_to_grid(value: int, step: int) -> int:
+    if value <= 0:
+        return 0
+    return ((value + step - 1) // step) * step
+
+
+def _build_teg(
+    shift_travel: Sequence[Sequence[Sequence[int]]],
+    shift_windows: Sequence[tuple[int, int]],
+    time_windows: Sequence[tuple[int, int]],
+    n: int,
+    depot: int,
+    service_time: int,
+    horizon: int,
+    t_max: int,
+    time_step: int,
+) -> tuple[dict[int, list[int]], list[TEGArc]]:
+    """Construct the time-expanded graph.
+
+    Returns `(nodes_at, arcs)` where `nodes_at[i]` is the sorted list of
+    valid time copies for customer i, and `arcs` is the flat list of
+    physically feasible arcs `((i, tau_i), (j, tau_j))`.
+    """
+    taus_all = list(range(0, horizon + 1, time_step))
+
+    nodes_at: dict[int, list[int]] = {}
+    for i in range(n):
+        a, b = time_windows[i]
+        if i == depot:
+            upper = min(int(b), int(t_max))
+            nodes_at[i] = [tau for tau in taus_all if 0 <= tau <= upper]
+        else:
+            nodes_at[i] = [tau for tau in taus_all if int(a) <= tau <= int(b)]
+
+    valid_set = {(i, tau) for i, taus in nodes_at.items() for tau in taus}
+
+    arcs: list[TEGArc] = []
+    for i in range(n):
+        # Depot only emits outgoing arcs from tau=0; the other depot copies
+        # are return-only sinks.
+        source_taus: Sequence[int] = (0,) if i == depot else nodes_at[i]
+        for tau in source_taus:
+            if (i, tau) not in valid_set:
+                continue
+            shift_idx = _shift_of(tau, shift_windows)
+            d_row = shift_travel[shift_idx][i]
+            st = 0 if i == depot else int(service_time)
+            for j in range(n):
+                if j == i:
+                    continue
+                arrive_raw = tau + st + int(d_row[j])
+                arrive = _round_up_to_grid(arrive_raw, time_step)
+                if j == depot:
+                    if arrive > t_max:
+                        continue
+                else:
+                    a_j, b_j = time_windows[j]
+                    if arrive < int(a_j):
+                        arrive = _round_up_to_grid(int(a_j), time_step)
+                    if arrive > int(b_j):
+                        continue
+                if (j, arrive) not in valid_set:
+                    continue
+                arcs.append(((i, tau), (j, arrive)))
+
+    return nodes_at, arcs
+
+
+def solve_toptw_teg_ilp(
+    shift_travel: Sequence[Sequence[Sequence[int]]],
+    shift_windows: Sequence[tuple[int, int]],
+    profits: Sequence[int],
+    time_windows: Sequence[tuple[int, int]],
+    num_vehicles: int,
+    t_max: int,
+    service_time: int,
+    horizon: int,
+    time_step: int,
+    depot: int = 0,
+    mandatory: Sequence[int] | None = None,
+    time_limit_seconds: int = 10,
+    num_workers: int = 8,
+    log_search_progress: bool = False,
+) -> SolveResult:
+    """Time-dependent TOPTW solved as an arc-flow ILP on a time-expanded graph.
+
+    Each TEG node is a pair `(customer, tau)`. Arcs are pre-filtered so that
+    `tau_dst = round_up(tau_src + service + d_ij[shift(tau_src)])` lands
+    inside the destination's time window and (for return-to-depot) within
+    `t_max`. Arrival earlier than a customer's window-open is bumped up,
+    encoding implicit waiting (loiter) at the destination.
+
+    `time_step` is the TEG resolution; finer grids approach the continuous
+    problem at the cost of more variables. Travel times and shift windows
+    should be commensurable with `time_step` to avoid systematic rounding
+    pessimism.
+    """
+    if len(shift_travel) != len(shift_windows):
+        raise ValueError("shift_travel and shift_windows must have the same length")
+    if not shift_travel:
+        raise ValueError("at least one shift is required")
+    n = len(shift_travel[0])
+    if any(len(m) != n or any(len(row) != n for row in m) for m in shift_travel):
+        raise ValueError("every shift_travel matrix must be n x n")
+    if len(profits) != n or len(time_windows) != n:
+        raise ValueError("profits and time_windows must have length n")
+    if time_step <= 0:
+        raise ValueError("time_step must be positive")
+
+    nodes_at, arcs = _build_teg(
+        shift_travel, shift_windows, time_windows,
+        n=n, depot=depot, service_time=service_time,
+        horizon=horizon, t_max=t_max, time_step=time_step,
+    )
+
+    model = cp_model.CpModel()
+
+    # x[arc, k] for every feasible TEG arc and every vehicle.
+    x: dict[tuple[TEGArc, int], cp_model.IntVar] = {}
+    for arc_idx, arc in enumerate(arcs):
+        for k in range(num_vehicles):
+            x[(arc, k)] = model.NewBoolVar(f"x_{arc_idx}_{k}")
+
+    # y[i] — was customer i visited (by any vehicle, at any time copy)?
+    y: dict[int, cp_model.IntVar] = {
+        i: model.NewBoolVar(f"y_{i}") for i in range(n) if i != depot
+    }
+
+    if mandatory:
+        for i in mandatory:
+            if i == depot:
+                raise ValueError("depot cannot be marked mandatory")
+            if not 0 <= i < n:
+                raise ValueError(f"mandatory index {i} out of range [0, {n})")
+            model.Add(y[i] == 1)
+
+    # Pre-index arcs by source and destination TEG nodes for fast constraint
+    # assembly.
+    out_of: dict[TEGNode, list[TEGArc]] = {}
+    in_to: dict[TEGNode, list[TEGArc]] = {}
+    for arc in arcs:
+        src, dst = arc
+        out_of.setdefault(src, []).append(arc)
+        in_to.setdefault(dst, []).append(arc)
+
+    # Visit indicator: y[i] = total inflow across all time copies, vehicles.
+    for i in range(n):
+        if i == depot:
+            continue
+        inflow_terms = [
+            x[(arc, k)]
+            for tau in nodes_at[i]
+            for arc in in_to.get((i, tau), [])
+            for k in range(num_vehicles)
+        ]
+        if inflow_terms:
+            model.Add(sum(inflow_terms) == y[i])
+        else:
+            model.Add(y[i] == 0)
+
+    # Flow conservation per vehicle at every customer time copy.
+    for k in range(num_vehicles):
+        for i in range(n):
+            if i == depot:
+                continue
+            for tau in nodes_at[i]:
+                node = (i, tau)
+                inflow = [x[(arc, k)] for arc in in_to.get(node, [])]
+                outflow = [x[(arc, k)] for arc in out_of.get(node, [])]
+                # If neither side has any arc this becomes 0 == 0; harmless.
+                model.Add(sum(inflow) == sum(outflow))
+
+    # Vehicle starts at (depot, 0) at most once; depot inflow = depot outflow.
+    for k in range(num_vehicles):
+        depot_out = [x[(arc, k)] for arc in out_of.get((depot, 0), [])]
+        depot_in_all = [
+            x[(arc, k)]
+            for tau in nodes_at[depot]
+            for arc in in_to.get((depot, tau), [])
+        ]
+        if depot_out:
+            model.Add(sum(depot_out) <= 1)
+        if depot_out or depot_in_all:
+            model.Add(sum(depot_out) == sum(depot_in_all))
+
+    # Objective: maximise collected profit.
+    model.Maximize(sum(int(profits[i]) * y[i] for i in y))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_limit_seconds)
+    solver.parameters.num_search_workers = int(num_workers)
+    solver.parameters.log_search_progress = bool(log_search_progress)
+
+    cpsat_status = solver.Solve(model)
+    mapped = _CPSAT_STATUS_MAP.get(cpsat_status, 0)
+    if mapped != 1:
+        return SolveResult(routes=[], total_distance=0, status=mapped)
+
+    # Reconstruct routes by following arcs from (depot, 0) per vehicle.
+    routes: list[list[int]] = []
+    schedule: list[dict] = []
+    total_distance = 0
+    for k in range(num_vehicles):
+        current: TEGNode = (depot, 0)
+        route_nodes: list[int] = [depot]
+        schedule.append({
+            "vehicle": k,
+            "node": depot,
+            "arrive": 0,
+            "leave": 0,
+        })
+        guard = 0
+        while True:
+            guard += 1
+            if guard > len(arcs) + 2:
+                raise RuntimeError("TEG route reconstruction did not terminate")
+            next_arc: TEGArc | None = None
+            for arc in out_of.get(current, []):
+                if solver.Value(x[(arc, k)]) == 1:
+                    next_arc = arc
+                    break
+            if next_arc is None:
+                break
+            src, dst = next_arc
+            j, tau_j = dst
+            tau_i = src[1]
+            shift_idx = _shift_of(tau_i, shift_windows)
+            total_distance += int(shift_travel[shift_idx][src[0]][j])
+            arrive = tau_j
+            leave = arrive + (0 if j == depot else int(service_time))
+            schedule.append({
+                "vehicle": k,
+                "node": j,
+                "arrive": arrive,
+                "leave": leave,
+            })
+            route_nodes.append(j)
+            current = dst
+            if j == depot:
+                break
+        routes.append(route_nodes)
+
+    visited: set[int] = set()
+    for route in routes:
+        for node in route:
+            if node != depot:
+                visited.add(node)
+    dropped = sorted(i for i in range(n) if i != depot and i not in visited)
+
+    total_profit = int(round(solver.ObjectiveValue()))
+
+    return SolveResult(
+        routes=routes,
+        total_distance=total_distance,
+        status=1,
+        dropped=dropped,
+        schedule=schedule,
+        total_profit=total_profit,
+    )

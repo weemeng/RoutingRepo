@@ -7,7 +7,11 @@ from vrp_lib.solver import (
     solve_tdvrp,
     solve_vrptw,
 )
-from vrp_lib.solver_ilp import solve_toptw_ilp, solve_vrptw_ilp
+from vrp_lib.solver_ilp import (
+    solve_toptw_ilp,
+    solve_toptw_teg_ilp,
+    solve_vrptw_ilp,
+)
 from vrp_lib.viz import plot_routes
 
 __all__ = [
@@ -20,6 +24,7 @@ __all__ = [
     "solve_routing",
     "solve_tdvrp",
     "solve_toptw_ilp",
+    "solve_toptw_teg_ilp",
     "solve_vrptw",
     "solve_vrptw_ilp",
 ]
