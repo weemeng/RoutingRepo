@@ -4,6 +4,7 @@ from vrp_lib.solver import (
     solve_cvrp,
     solve_pdptw,
     solve_routing,
+    solve_tdvrp,
     solve_vrptw,
 )
 from vrp_lib.solver_ilp import solve_toptw_ilp, solve_vrptw_ilp
@@ -17,6 +18,7 @@ __all__ = [
     "solve_cvrp",
     "solve_pdptw",
     "solve_routing",
+    "solve_tdvrp",
     "solve_toptw_ilp",
     "solve_vrptw",
     "solve_vrptw_ilp",

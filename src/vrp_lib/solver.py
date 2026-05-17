@@ -394,3 +394,114 @@ def solve_pdptw(
         loads=loads,
         schedule=schedule,
     )
+
+
+def solve_tdvrp(
+    shift_travel: Sequence[Sequence[Sequence[int]]],
+    shift_windows: Sequence[tuple[int, int]],
+    demands: Sequence[int],
+    time_windows: Sequence[tuple[int, int]],
+    vehicle_capacity: int,
+    service_time: int,
+    horizon: int,
+    depot: int = 0,
+    wait_slack: int = 60,
+    time_limit_seconds: int = 5,
+    first_solution_strategy: int = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
+    local_search_metaheuristic: int = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
+) -> SolveResult:
+    """Time-Dependent VRP via shift-copy vehicles.
+
+    Each shift is one vehicle with its own travel-time matrix. The shift's
+    Start and End cumul vars are constrained to its window so it operates
+    only within that time-of-day band. Arc cost equals travel time.
+    """
+    if len(shift_travel) != len(shift_windows):
+        raise ValueError("shift_travel and shift_windows must have the same length")
+
+    n = len(shift_travel[0])
+    num_vehicles = len(shift_travel)
+    manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
+    routing = pywrapcp.RoutingModel(manager)
+
+    transit_indices: list[int] = []
+    cost_indices: list[int] = []
+    for matrix in shift_travel:
+        def make_time_cb(m=matrix):
+            def cb(fi: int, ti: int) -> int:
+                fn = manager.IndexToNode(fi)
+                tn = manager.IndexToNode(ti)
+                st = 0 if fn == depot else service_time
+                return st + m[fn][tn]
+            return cb
+        def make_cost_cb(m=matrix):
+            def cb(fi: int, ti: int) -> int:
+                return m[manager.IndexToNode(fi)][manager.IndexToNode(ti)]
+            return cb
+        transit_indices.append(routing.RegisterTransitCallback(make_time_cb()))
+        cost_indices.append(routing.RegisterTransitCallback(make_cost_cb()))
+
+    for v in range(num_vehicles):
+        routing.SetArcCostEvaluatorOfVehicle(cost_indices[v], v)
+
+    def demand_cb(fi: int) -> int:
+        return demands[manager.IndexToNode(fi)]
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_idx, 0, [vehicle_capacity] * num_vehicles, True, "Capacity",
+    )
+
+    routing.AddDimensionWithVehicleTransits(
+        transit_indices, wait_slack, horizon, False, "Time",
+    )
+    time_dim = routing.GetDimensionOrDie("Time")
+
+    for node in range(n):
+        if node == depot:
+            continue
+        a, b = time_windows[node]
+        time_dim.CumulVar(manager.NodeToIndex(node)).SetRange(int(a), int(b))
+
+    for v, (lo, hi) in enumerate(shift_windows):
+        time_dim.CumulVar(routing.Start(v)).SetRange(int(lo), int(hi))
+        time_dim.CumulVar(routing.End(v)).SetRange(int(lo), int(hi))
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.Start(v)))
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.End(v)))
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = first_solution_strategy
+    params.local_search_metaheuristic = local_search_metaheuristic
+    params.time_limit.FromSeconds(time_limit_seconds)
+
+    solution = routing.SolveWithParameters(params)
+    if solution is None:
+        return SolveResult(routes=[], total_distance=0, status=routing.status())
+
+    routes: list[list[int]] = []
+    schedule: list[dict] = []
+    total = 0
+    for v in range(num_vehicles):
+        idx = routing.Start(v)
+        route: list[int] = []
+        while not routing.IsEnd(idx):
+            node = manager.IndexToNode(idx)
+            route.append(node)
+            schedule.append({
+                "vehicle": v,
+                "node": node,
+                "arrive": solution.Min(time_dim.CumulVar(idx)),
+            })
+            prev = idx
+            idx = solution.Value(routing.NextVar(idx))
+            total += routing.GetArcCostForVehicle(prev, idx, v)
+        end_node = manager.IndexToNode(idx)
+        schedule.append({
+            "vehicle": v,
+            "node": end_node,
+            "arrive": solution.Min(time_dim.CumulVar(idx)),
+        })
+        route.append(end_node)
+        routes.append(route)
+
+    return SolveResult(routes=routes, total_distance=total,
+                       status=routing.status(), schedule=schedule)
