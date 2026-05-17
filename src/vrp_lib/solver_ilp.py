@@ -216,6 +216,7 @@ def solve_toptw_ilp(
     depot: int = 0,
     demands: Sequence[int] | None = None,
     vehicle_capacities: Sequence[int] | None = None,
+    mandatory: Sequence[int] | None = None,
     time_limit_seconds: int = 10,
     num_workers: int = 8,
     log_search_progress: bool = False,
@@ -225,6 +226,10 @@ def solve_toptw_ilp(
     Customers carry a profit and visits are optional. Each vehicle has a
     per-route duration budget `t_max`. Capacity constraints are activated
     only when both `demands` and `vehicle_capacities` are provided.
+
+    Customers listed in `mandatory` must appear on some vehicle's route;
+    the problem becomes infeasible if a mandatory customer cannot be
+    reached within its time window and the duration budget.
     """
     n = len(distance)
     if (demands is None) != (vehicle_capacities is None):
@@ -242,6 +247,14 @@ def solve_toptw_ilp(
     y: dict[int, cp_model.IntVar] = {
         i: model.NewBoolVar(f"y_{i}") for i in range(n) if i != depot
     }
+
+    if mandatory:
+        for i in mandatory:
+            if i == depot:
+                raise ValueError("depot cannot be marked mandatory")
+            if not 0 <= i < n:
+                raise ValueError(f"mandatory index {i} out of range [0, {n})")
+            model.Add(y[i] == 1)
 
     depot_open, depot_close = time_windows[depot]
     t: dict[tuple[int, int], cp_model.IntVar] = {}
