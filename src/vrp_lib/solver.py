@@ -153,6 +153,8 @@ def solve_vrptw(
     depot: int = 0,
     wait_slack: int = 60,
     time_limit_seconds: int = 5,
+    early_penalty: int | None = None,
+    late_penalty: int | None = None,
     first_solution_strategy: int = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
     local_search_metaheuristic: int = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
 ) -> SolveResult:
@@ -185,11 +187,20 @@ def solve_vrptw(
     routing.AddDimension(time_idx, wait_slack, horizon, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
+    soft_windows = early_penalty is not None or late_penalty is not None
     for node in range(n):
         if node == depot:
             continue
         a, b = time_windows[node]
-        time_dim.CumulVar(manager.NodeToIndex(node)).SetRange(int(a), int(b))
+        node_idx = manager.NodeToIndex(node)
+        if soft_windows:
+            time_dim.CumulVar(node_idx).SetRange(0, horizon)
+            if early_penalty is not None:
+                time_dim.SetCumulVarSoftLowerBound(node_idx, int(a), int(early_penalty))
+            if late_penalty is not None:
+                time_dim.SetCumulVarSoftUpperBound(node_idx, int(b), int(late_penalty))
+        else:
+            time_dim.CumulVar(node_idx).SetRange(int(a), int(b))
 
     depot_open, depot_close = time_windows[depot]
     for v in range(num_vehicles):
