@@ -14,6 +14,7 @@ class SolveResult:
     loads: list[int] = field(default_factory=list)
     dropped: list[int] = field(default_factory=list)
     schedule: list[dict] = field(default_factory=list)
+    total_profit: int = 0
 
 
 def solve_routing(
